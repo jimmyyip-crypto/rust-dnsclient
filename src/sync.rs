@@ -1,9 +1,9 @@
 use crate::upstream_server::UpstreamServer;
-use dnssector::constants::{Class, Type, DNS_MAX_COMPRESSED_SIZE};
+use dnssector::constants::{Class, Type};
 use dnssector::*;
 use rand::Rng;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -43,54 +43,32 @@ impl DNSClient {
         query_question: &Option<(Vec<u8>, u16, u16)>,
         query: &[u8],
     ) -> Result<ParsedPacket, io::Error> {
-        let local_addr = match upstream_server.addr {
-            SocketAddr::V4(_) => &self.local_v4_addr,
-            SocketAddr::V6(_) => &self.local_v6_addr,
-        };
         let mut parsed_response = {
-            // UDP
-            let socket = UdpSocket::bind(local_addr)?;
-            let _ = socket.set_read_timeout(Some(Duration::new(5, 0)));
-            socket.connect(upstream_server.addr)?;
-            socket.send(&query)?;
-            let mut response = vec![0; DNS_MAX_COMPRESSED_SIZE];
-            let response_len = socket
-                .recv(&mut response)
-                .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "Timeout"))?;
-            response.truncate(response_len);
+            // TCP
+            let mut stream = TcpStream::connect_timeout(
+                &upstream_server.addr,
+                self.upstream_server_timeout,
+            )?;
+            let _ = stream.set_read_timeout(Some(self.upstream_server_timeout));
+            let _ = stream.set_write_timeout(Some(self.upstream_server_timeout));
+            let _ = stream.set_nodelay(true);
+            let query_len = query.len();
+            let mut tcp_query = Vec::with_capacity(2 + query_len);
+            tcp_query.push((query_len >> 8) as u8);
+            tcp_query.push(query_len as u8);
+            tcp_query.extend_from_slice(query);
+            stream.write_all(&tcp_query)?;
+            let mut response_len_bytes = [0u8; 2];
+            stream.read_exact(&mut response_len_bytes)?;
+            let response_len =
+                ((response_len_bytes[0] as usize) << 8) | (response_len_bytes[1] as usize);
+            let mut response = vec![0; response_len];
+            stream.read_exact(&mut response)?;
             DNSSector::new(response)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
                 .parse()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
         };
-        if parsed_response.flags() & DNS_FLAG_TC == DNS_FLAG_TC {
-            parsed_response = {
-                // TCP
-                let mut stream = TcpStream::connect_timeout(
-                    &upstream_server.addr,
-                    self.upstream_server_timeout,
-                )?;
-                let _ = stream.set_read_timeout(Some(self.upstream_server_timeout));
-                let _ = stream.set_write_timeout(Some(self.upstream_server_timeout));
-                let _ = stream.set_nodelay(true);
-                let query_len = query.len();
-                let mut tcp_query = Vec::with_capacity(2 + query_len);
-                tcp_query.push((query_len >> 8) as u8);
-                tcp_query.push(query_len as u8);
-                tcp_query.extend_from_slice(query);
-                stream.write_all(&tcp_query)?;
-                let mut response_len_bytes = [0u8; 2];
-                stream.read_exact(&mut response_len_bytes)?;
-                let response_len =
-                    ((response_len_bytes[0] as usize) << 8) | (response_len_bytes[1] as usize);
-                let mut response = vec![0; response_len];
-                stream.read_exact(&mut response)?;
-                DNSSector::new(response)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
-                    .parse()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
-            }
-        }
         if parsed_response.tid() != query_tid || &parsed_response.question() != query_question {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
